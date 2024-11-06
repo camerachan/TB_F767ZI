@@ -24,6 +24,10 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "stdio.h"
+#include "lwip/apps/httpd.h"
+#include "lwip/netif.h"
+#include "lwip/tcpip.h"
+#include "ethernetif.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -50,6 +54,7 @@ SPI_HandleTypeDef hspi4;
 UART_HandleTypeDef huart5;
 
 osThreadId defaultTaskHandle;
+osThreadId LED_TaskHandle;
 /* USER CODE BEGIN PV */
 
 #ifdef __GNUC__
@@ -77,6 +82,7 @@ static void MX_UART5_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_SPI4_Init(void);
 void StartDefaultTask(void const * argument);
+void startLED_Task(void const * argument);
 
 /* USER CODE BEGIN PFP */
 void __io_putchar(uint8_t ch){
@@ -109,8 +115,63 @@ void LP5036_SetBrightness(uint8_t channel, uint8_t brightness){
 	uint8_t data[2];
 
 	data[0] = LED0_BRIGHTNESS + 12 + channel;
-	data[1] = brightness; // 0x00~0xFFの??��?��?囲で設??��?��?
+	data[1] = brightness;
 	HAL_I2C_Master_Transmit(&hi2c1, LP5036_I2C_ADDR, data, 2, HAL_MAX_DELAY);
+}
+
+// ?????��?��??��?��???��?��??��?��????��?��??��?��???��?��??��?��?数字�??????��?��??��?��???��?��??��?��????��?��??��?��???��?��??��?��セグメントパターン??????��?��??��?��???��?��??��?��????��?��??��?��???��?��??��?��?50=点灯?????��?��??��?��???��?��??��?��????��?��??��?��???��?��??��?��?0=消�??????��?��??��?��???��?��??��?��????��?��??��?��???��?��??��?��??????��?��??��?��???��?��??��?��????��?��??��?��???��?��??��?��?
+const uint8_t segment_patterns[10][8] = {
+    {50, 50, 50, 50, 50, 50, 0, 0},       // 0
+    {0, 50, 50, 0, 0, 0, 0, 0},           // 1
+    {50, 50, 0, 50, 50, 0, 50, 0},        // 2
+    {50, 50, 50, 50, 0, 0, 50, 0},        // 3
+    {0, 50, 50, 0, 0, 50, 50, 0},         // 4
+    {50, 0, 50, 50, 0, 50, 50, 0},        // 5
+    {50, 0, 50, 50, 50, 50, 50, 0},       // 6
+    {50, 50, 50, 0, 0, 0, 0, 0},          // 7
+    {50, 50, 50, 50, 50, 50, 50, 0},      // 8
+    {50, 50, 50, 50, 0, 50, 50, 0}        // 9
+};
+
+void Seven_seg_set(uint8_t digit, uint8_t data)
+{
+    uint8_t dig_data = 8;
+
+    if(data <= 9){
+        for(int i = 0; i < 8; i++){
+            LP5036_SetBrightness(i + dig_data * digit, segment_patterns[data][i]);
+        }
+    }else{
+        for(int i=0; i<8; i++){
+            LP5036_SetBrightness(i + dig_data * digit, 0);
+        }
+    }
+}
+
+void http_server_netconn_init(void) {
+    tcpip_init(NULL, NULL);
+
+    struct netif gnetif;
+    ip_addr_t ipaddr, netmask, gw;
+
+    IP4_ADDR(&ipaddr, 192, 168, 0, 100);
+    IP4_ADDR(&netmask, 255, 255, 255, 0);
+    IP4_ADDR(&gw, 192, 168, 0, 1);
+
+    netif_add(&gnetif, &ipaddr, &netmask, &gw, NULL, &ethernetif_init, &tcpip_input);
+    netif_set_default(&gnetif);
+    netif_set_up(&gnetif);
+
+    httpd_init();
+}
+
+void splitDigits(int number, int *digits)
+{
+	for(int i=0; i<4; i++)
+	{
+		digits[i] = number % 10;
+		number /= 10;
+	}
 }
 
 void LCD_Reset(void)
@@ -157,13 +218,13 @@ void LCD_Fill_Screen(uint16_t color) {
     uint8_t color_high = color >> 8;
     uint8_t color_low = color & 0xFF;
 
-    LCD_Write_Command(0x2A); // カラムアドレス設定
+    LCD_Write_Command(0x2A);
     LCD_Write_Data(0x00);
     LCD_Write_Data(0x00);
     LCD_Write_Data(0x00);
     LCD_Write_Data(0x7F);
 
-    LCD_Write_Command(0x2B); // ページアドレス設定
+    LCD_Write_Command(0x2B);
     LCD_Write_Data(0x00);
     LCD_Write_Data(0x00);
     LCD_Write_Data(0x00);
@@ -246,15 +307,19 @@ int main(void)
 
   /* Create the thread(s) */
   /* definition and creation of defaultTask */
-  //osThreadDef(defaultTask, StartDefaultTask, osPriorityNormal, 0, 512);
-  //defaultTaskHandle = osThreadCreate(osThread(defaultTask), NULL);
+  osThreadDef(defaultTask, StartDefaultTask, osPriorityNormal, 0, 512);
+  defaultTaskHandle = osThreadCreate(osThread(defaultTask), NULL);
+
+  /* definition and creation of LED_Task */
+  osThreadDef(LED_Task, startLED_Task, osPriorityBelowNormal, 0, 128);
+  LED_TaskHandle = osThreadCreate(osThread(LED_Task), NULL);
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
   /* USER CODE END RTOS_THREADS */
 
   /* Start scheduler */
-  //osKernelStart();
+  osKernelStart();
 
   /* We should never get here as control is now taken by the scheduler */
 
@@ -267,15 +332,7 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
 	  //printf("Hello World! %f\n\r", i);
-	  for(int j=0;j<33;j++){
-		  LP5036_SetBrightness(j,100);
-		  if(j==0){
-			  LP5036_SetBrightness(32,0);
-		  }else{
-			  LP5036_SetBrightness(j-1,0);
-		  }
-		  HAL_Delay(100);
-	  }
+	  HAL_Delay(1000);
   }
   /* USER CODE END 3 */
 }
@@ -349,7 +406,7 @@ static void MX_I2C1_Init(void)
 
   /* USER CODE END I2C1_Init 1 */
   hi2c1.Instance = I2C1;
-  hi2c1.Init.Timing = 0x20404768;
+  hi2c1.Init.Timing = 0x6000030D;
   hi2c1.Init.OwnAddress1 = 0;
   hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
   hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
@@ -398,18 +455,18 @@ static void MX_SPI4_Init(void)
   /* SPI4 parameter configuration*/
   hspi4.Instance = SPI4;
   hspi4.Init.Mode = SPI_MODE_MASTER;
-  hspi4.Init.Direction = SPI_DIRECTION_1LINE;
-  hspi4.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi4.Init.Direction = SPI_DIRECTION_2LINES;
+  hspi4.Init.DataSize = SPI_DATASIZE_4BIT;
   hspi4.Init.CLKPolarity = SPI_POLARITY_LOW;
   hspi4.Init.CLKPhase = SPI_PHASE_1EDGE;
   hspi4.Init.NSS = SPI_NSS_SOFT;
-  hspi4.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_16;
+  hspi4.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_2;
   hspi4.Init.FirstBit = SPI_FIRSTBIT_MSB;
   hspi4.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi4.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
   hspi4.Init.CRCPolynomial = 7;
   hspi4.Init.CRCLength = SPI_CRC_LENGTH_DATASIZE;
-  hspi4.Init.NSSPMode = SPI_NSS_PULSE_DISABLE;
+  hspi4.Init.NSSPMode = SPI_NSS_PULSE_ENABLE;
   if (HAL_SPI_Init(&hspi4) != HAL_OK)
   {
     Error_Handler();
@@ -480,7 +537,7 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pin = GPIO_PIN_3|GPIO_PIN_4|GPIO_PIN_1;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
 
 /* USER CODE BEGIN MX_GPIO_Init_2 */
@@ -519,14 +576,44 @@ void StartDefaultTask(void const * argument)
   /* Infinite loop */
   for(;;)
   {
-	  p = pbuf_alloc(PBUF_TRANSPORT, sizeof(4), PBUF_RAM);
-      *(uint32_t *)p->payload = cnt++;
-      p->len = 4;
-      err = udp_sendto(pcb, p, &dst_addr, dst_port);
-      pbuf_free(p);
-      osDelay(1000);
+//	  p = pbuf_alloc(PBUF_TRANSPORT, sizeof(4), PBUF_RAM);
+//      *(uint32_t *)p->payload = cnt++;
+//      p->len = 4;
+//      err = udp_sendto(pcb, p, &dst_addr, dst_port);
+//      pbuf_free(p);
+      osDelay(10);
     }
   /* USER CODE END 5 */
+}
+
+/* USER CODE BEGIN Header_startLED_Task */
+/**
+* @brief Function implementing the LED_Task thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_startLED_Task */
+void startLED_Task(void const * argument)
+{
+  /* USER CODE BEGIN startLED_Task */
+  int display_number;
+  int digits[4]={0};
+  LP5036_SetBrightness(15,100);
+  /* Infinite loop */
+  for(;;)
+  {
+    for(display_number=0; display_number<10000;display_number++)
+    {
+	  splitDigits(display_number, digits);
+	  for(int i=0;i<4;i++)
+	  {
+	    Seven_seg_set(i, digits[i]);
+	  }
+	  osDelay(100);
+	}
+
+  }
+  /* USER CODE END startLED_Task */
 }
 
  /* MPU Configuration */
